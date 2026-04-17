@@ -2,6 +2,7 @@
 """Extract papers from DBLP XML database by venue and export to CSV."""
 
 import argparse
+import collections
 import csv
 import logging
 import os
@@ -21,7 +22,7 @@ ALL_FIELDS = [
     'publisher', 'isbn', 'series', 'month',
 ]
 
-DEFAULT_FIELDS = ['year', 'title', 'doi']
+DEFAULT_FIELDS = ['year', 'key', 'title', 'doi']
 
 PROGRESS_INTERVAL = 100_000
 
@@ -140,12 +141,44 @@ def _create_xml_parser(xml_path: str) -> ET.XMLParser:
     return xml_parser
 
 
-def _scan_records(xml_path: str, venue_name: str) -> list[dict[str, str]]:
-    """Iterate over the DBLP XML and collect records matching the venue."""
+def _extract_venue_from_key(record_key: str) -> str:
+    """Extract the venue prefix (first two path segments) from a DBLP key.
+
+    Example: 'conf/ispass/SmithJ23' → 'conf/ispass'
+             'journals/taco/Doe2024' → 'journals/taco'
+    """
+    parts = record_key.split('/')
+    if len(parts) >= 2:
+        return parts[0] + '/' + parts[1]
+    return record_key
+
+
+def _scan_records(
+    xml_path: str,
+    venue_pattern: str,
+    limit: Optional[int] = None,
+) -> dict[str, list[dict[str, str]]]:
+    """Iterate over the DBLP XML and collect records whose key matches the venue pattern.
+
+    The venue_pattern is matched against the venue prefix of each record key
+    (e.g. 'conf/ispass', 'journals/taco'). It can be a plain prefix or a regex.
+
+    If limit is set, stop after collecting that many matched records.
+
+    Returns a dict mapping each matched venue to its list of records.
+    """
     xml_parser = _create_xml_parser(xml_path)
     context = ET.iterparse(xml_path, events=('end',), parser=xml_parser)
 
-    results: list[dict[str, str]] = []
+    try:
+        compiled_pattern = re.compile(venue_pattern)
+        is_regex = True
+    except re.error:
+        logger.warning("Invalid regex '%s', treating as literal prefix.", venue_pattern)
+        compiled_pattern = None
+        is_regex = False
+
+    grouped_results: dict[str, list[dict[str, str]]] = collections.defaultdict(list)
     total_count = 0
     matched_count = 0
 
@@ -155,17 +188,43 @@ def _scan_records(xml_path: str, venue_name: str) -> list[dict[str, str]]:
 
         total_count += 1
         if total_count % PROGRESS_INTERVAL == 0:
-            logger.info("Processed %d records ...", total_count)
+            logger.info("Processed %d records, matched %d ...", total_count, matched_count)
 
         record_key = element.get('key', '')
-        if record_key.startswith(venue_name):
-            results.append(_extract_record(element, venue_name))
+        venue_key = _extract_venue_from_key(record_key)
+
+        matched = False
+        if is_regex and compiled_pattern is not None:
+            matched = compiled_pattern.fullmatch(venue_key) is not None
+        else:
+            matched = record_key.startswith(venue_pattern)
+
+        if matched:
+            grouped_results[venue_key].append(_extract_record(element, venue_key))
             matched_count += 1
+            if limit is not None and matched_count >= limit:
+                logger.info("Reached limit of %d matched records, stopping early.", limit)
+                element.clear()
+                break
 
         element.clear()
 
-    logger.info("Scanned %d records, matched %d for venue '%s'.", total_count, matched_count, venue_name)
-    return results
+    venues_found = sorted(grouped_results.keys())
+    logger.info(
+        "Scanned %d records, matched %d across %d venue(s): %s",
+        total_count, matched_count, len(venues_found), ", ".join(venues_found) or "(none)",
+    )
+    return dict(grouped_results)
+
+
+def _venue_to_filename(venue_key: str) -> str:
+    """Convert a venue key to a safe CSV filename.
+
+    Replaces path separators with underscores to preserve the full venue path.
+    Example: 'conf/ispass' → 'conf_ispass.csv', 'journals/taco' → 'journals_taco.csv'
+    """
+    safe_name = venue_key.strip('/').replace('/', '_')
+    return safe_name + '.csv'
 
 
 def write_csv(records: list[dict[str, str]], output_path: str, fieldnames: list[str]) -> None:
@@ -179,18 +238,44 @@ def write_csv(records: list[dict[str, str]], output_path: str, fieldnames: list[
 
 def parse_dblp(
     xml_path: str,
-    venue_name: str,
-    output_csv: str,
+    venue_pattern: str,
+    output_path: Optional[str] = None,
+    output_dir: Optional[str] = None,
     fields: Optional[list[str]] = None,
+    limit: Optional[int] = None,
 ) -> None:
-    """Main pipeline: scan DBLP XML for a venue, sort by year, and write CSV."""
-    logger.info("Processing %s for venue '%s' ...", xml_path, venue_name)
+    """Main pipeline: scan DBLP XML for venue(s), sort by year, and write CSV(s).
 
-    records = _scan_records(xml_path, venue_name)
-    _sort_by_year(records)
+    If the venue_pattern matches multiple venues, each venue is written to a
+    separate CSV file under output_dir (default: current directory).
+    If only one venue matches and output_path is given, that path is used.
+    """
+    logger.info("Processing %s for venue pattern '%s' ...", xml_path, venue_pattern)
+
+    grouped_records = _scan_records(xml_path, venue_pattern, limit=limit)
+
+    if not grouped_records:
+        logger.warning("No records matched venue pattern '%s'.", venue_pattern)
+        return
 
     fieldnames = _validate_fields(fields)
-    write_csv(records, output_csv, fieldnames)
+    resolved_output_dir = output_dir or '.'
+
+    if len(grouped_records) == 1 and output_path:
+        venue_key = next(iter(grouped_records))
+        records = grouped_records[venue_key]
+        _sort_by_year(records)
+        write_csv(records, output_path, fieldnames)
+    else:
+        if output_dir:
+            os.makedirs(resolved_output_dir, exist_ok=True)
+
+        for venue_key in sorted(grouped_records):
+            records = grouped_records[venue_key]
+            _sort_by_year(records)
+            filename = _venue_to_filename(venue_key)
+            filepath = os.path.join(resolved_output_dir, filename)
+            write_csv(records, filepath, fieldnames)
 
     logger.info("Done.")
 
@@ -202,7 +287,11 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     )
     argument_parser.add_argument(
         'venue',
-        help='DBLP key prefix for the venue (e.g., "conf/ispass", "journals/taco")',
+        help=(
+            'Venue key prefix or regex pattern to match against DBLP keys. '
+            'Examples: "conf/ispass" (exact), "conf/(ispass|iiswc)" (regex), '
+            '"journals/t.*" (regex matching all journals starting with t)'
+        ),
     )
     argument_parser.add_argument(
         '--xml', default='dblp.xml',
@@ -210,7 +299,18 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     )
     argument_parser.add_argument(
         '--output', default=None,
-        help='Output CSV filename (default: derived from venue, e.g. conf/ispass → ispass.csv)',
+        help=(
+            'Output CSV filename (only used when a single venue matches). '
+            'Default: derived from venue name, e.g. conf/ispass → ispass.csv'
+        ),
+    )
+    argument_parser.add_argument(
+        '--output-dir', default=None,
+        help=(
+            'Output directory for CSV files when multiple venues match. '
+            'Each venue gets its own file (e.g. ispass.csv, iiswc.csv). '
+            'Default: current directory'
+        ),
     )
     argument_parser.add_argument(
         '--fields',
@@ -222,8 +322,11 @@ def _build_argument_parser() -> argparse.ArgumentParser:
             f'Available: {", ".join(ALL_FIELDS)}'
         ),
     )
+    argument_parser.add_argument(
+        '--limit', type=int, default=None,
+        help='Maximum number of matched records to collect (default: no limit). Useful for testing.',
+    )
     return argument_parser
-
 
 def main() -> None:
     """CLI entry point."""
@@ -240,16 +343,18 @@ def main() -> None:
         logger.error("XML file not found: %s", args.xml)
         sys.exit(1)
 
-    if args.output is None:
-        # "conf/ispass" → "ispass.csv", "journals/taco" → "taco.csv"
-        venue_basename = args.venue.rstrip('/').split('/')[-1]
-        args.output = f"{venue_basename}.csv"
-
     selected_fields = None
     if args.fields:
         selected_fields = [field.strip() for field in args.fields.split(',')]
 
-    parse_dblp(args.xml, args.venue, args.output, selected_fields)
+    parse_dblp(
+        xml_path=args.xml,
+        venue_pattern=args.venue,
+        output_path=args.output,
+        output_dir=args.output_dir,
+        fields=selected_fields,
+        limit=args.limit,
+    )
 
 
 if __name__ == "__main__":
