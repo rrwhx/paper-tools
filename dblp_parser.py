@@ -109,9 +109,12 @@ def _extract_record(element: ET.Element, venue_name: str) -> dict[str, str]:
     }
 
 
-def _sort_by_year(records: list[dict[str, str]]) -> None:
-    """Sort records in-place by year (numerically)."""
-    records.sort(key=lambda record: int(record['year']) if record['year'].isdigit() else 0)
+def _sort_records(records: list[dict[str, str]]) -> None:
+    """Sort records in-place by year (numerically, ascending), then by title (alphabetically)."""
+    records.sort(key=lambda record: (
+        int(record['year']) if record['year'].isdigit() else 0,
+        record.get('title', '').lower(),
+    ))
 
 
 def _validate_fields(fields: Optional[list[str]]) -> list[str]:
@@ -264,7 +267,7 @@ def parse_dblp(
     if len(grouped_records) == 1 and output_path:
         venue_key = next(iter(grouped_records))
         records = grouped_records[venue_key]
-        _sort_by_year(records)
+        _sort_records(records)
         write_csv(records, output_path, fieldnames)
     else:
         if output_dir:
@@ -272,7 +275,7 @@ def parse_dblp(
 
         for venue_key in sorted(grouped_records):
             records = grouped_records[venue_key]
-            _sort_by_year(records)
+            _sort_records(records)
             filename = _venue_to_filename(venue_key)
             filepath = os.path.join(resolved_output_dir, filename)
             write_csv(records, filepath, fieldnames)
